@@ -9,7 +9,8 @@ from .. import config
 from .types import QUESTION_TYPE_MAP, MODEL_MAP, deep_blank_model, WHITELISTED_QUESTION_TYPES
 from ..config import GRAPHQL_URL, CONFIG_DIR
 from .queries import (GET_STATE_QUERY, SAVE_RESPONSES_QUERY, SUBMIT_DRAFT_QUERY,
-                      INITIATE_ATTEMPT_QUERY, ASSIGNMENT_FEEDBACK_QUERY)
+                      INITIATE_ATTEMPT_QUERY, ASSIGNMENT_FEEDBACK_QUERY,
+                      GET_WIDGET_SESSION_QUERY)
 from loguru import logger
 from ..llm.connector import DEFAULT_RESPONSE_SCHEMA, PerplexityConnector, GeminiConnector
 from ..session_utils import get_csrf_headers, random_delay
@@ -20,13 +21,14 @@ SYSTEM_PROMPT = (
     "The questions are in a dict format where each key represents the question id, and the value is a JSON dict containing:\n"
     "- 'Question': the question text (which might have HTML tags, ignore them).\n"
     "- 'Options': a list of options (for MULTIPLE_CHOICE and CHECKBOX types) with option_id and value.\n"
-    "- 'Type': one of 'MULTIPLE_CHOICE', 'CHECKBOX', or 'TEXT_REFLECT'.\n"
+    "- 'Type': one of 'MULTIPLE_CHOICE', 'CHECKBOX', 'TEXT_REFLECT', 'RICH_TEXT', 'NUMERIC', 'REGEX', 'TEXT_EXACT_MATCH', 'PLAIN_TEXT', or 'MATH'.\n"
     "- 'previous_attempts': (optional, only for CHECKBOX) past attempt results.\n\n"
     "Rules for each question type:\n"
     "1. MULTIPLE_CHOICE: Single-choice question. Select exactly one option_id and place it in the 'chosen' list.\n"
     "2. CHECKBOX: Multi-choice question. Select one or more option_ids and place them in the 'chosen' list.\n"
-    "3. TEXT_REFLECT: Question with no options. Answer the question prompt thoughtfully and precisely "
-    "matching the question content. The response in the 'answer' field must be a high-quality, relevant response directly answering the prompt.\n\n"
+    "3. TEXT_REFLECT, RICH_TEXT, NUMERIC, REGEX, TEXT_EXACT_MATCH, PLAIN_TEXT, MATH: Questions with no options. "
+    "Answer the prompt in the 'answer' field string. For NUMERIC questions, provide only the number (e.g. '40' or '3.14'). "
+    "For text/math/regex/reflection questions, provide a precise, high-quality response directly answering the prompt.\n\n"
     "IMPORTANT for CHECKBOX:\n"
     "If a question has 'previous_attempts', each entry records a prior submission of chosen option_ids:\n"
     "- 'response' is a list of option_ids that were chosen together.\n"
@@ -38,7 +40,14 @@ SYSTEM_PROMPT = (
 TYPE_LOOKUP = {
     "MULTIPLE_CHOICE": ("multipleChoiceResponse", "chosen"),
     "CHECKBOX": ("checkboxResponse", "chosen"),
-    "TEXT_REFLECT": ("textReflectResponse", "answer")
+    "TEXT_REFLECT": ("textReflectResponse", "answer"),
+    "RICH_TEXT": ("richTextResponse", "richText"),
+    "NUMERIC": ("numericResponse", "answer"),
+    "REGEX": ("regexResponse", "answer"),
+    "TEXT_EXACT_MATCH": ("textExactMatchResponse", "answer"),
+    "PLAIN_TEXT": ("plainTextResponse", "plainText"),
+    "MATH": ("mathResponse", "answer"),
+    "WIDGET": ("widgetResponse", "answer")
 }
 
 
@@ -50,6 +59,7 @@ class GradedSolver(object):
         self.attempt_id = None
         self.draft_id = None
         self.discarded_questions = []
+        self.widget_metadata = {}
 
         self.data_dir = CONFIG_DIR / "gradedData"
         os.makedirs(self.data_dir, exist_ok=True)
@@ -68,6 +78,11 @@ class GradedSolver(object):
         with open(self.data_file, "w", encoding="utf-8") as f:
             json.dump(self.questions_data, f, ensure_ascii=False, indent=4)
 
+    def _get_headers(self) -> dict[str, str]:
+        headers = get_csrf_headers(self.session)
+        headers["User-Agent"] = "coursera-locking-browser/0.6.6"
+        return headers
+
     def _get_response_text(self, options: list[dict], response: str | list[str]) -> str | list[str]:
         if isinstance(response, list):
             return [opt["value"] for opt in options if opt["option_id"] in response]
@@ -77,14 +92,106 @@ class GradedSolver(object):
                     return opt["value"]
             return response
 
+    def fetch_widget_data(self, widget_session_id: str) -> dict:
+        widget_config = {}
+        rpc_values = {}
+
+        if self.session is not None:
+            try:
+                res = self.session.post(url=GRAPHQL_URL, headers=self._get_headers(), params={
+                    "opname": "GetWidgetSessionBySessionId"
+                }, json={
+                    "operationName": "GetWidgetSessionBySessionId",
+                    "variables": {
+                        "sessionId": widget_session_id
+                    },
+                    "query": GET_WIDGET_SESSION_QUERY
+                })
+                data = res.json()
+                session_info = data["data"]["WidgetSessions"]["queryWidgetSessionBySessionId"]
+                widget_config = session_info.get(
+                    "configuration", {}).get("data", {})
+            except Exception as e:
+                logger.debug(f"Failed to fetch widget session config: {e}")
+
+            rpc_url = f"https://www.coursera.org/api/widgetRpcActions.v1/?sessionId={widget_session_id}&action=getStoredValues"
+            try:
+                rpc_res = self.session.post(url=rpc_url, headers=self._get_headers(), json={
+                    "names": ["timers", "answer", "questionId", "answersOrder"]
+                })
+                if rpc_res.status_code == 200:
+                    rpc_values = rpc_res.json()
+            except Exception as e:
+                logger.debug(f"Failed to fetch widget RPC stored values: {e}")
+
+        quiz_id = widget_config.get("quizId")
+        timers = rpc_values.get("timers") or {}
+        time_start = None
+        if quiz_id and quiz_id in timers:
+            time_start = timers[quiz_id].get("startTime")
+        if not time_start and timers:
+            first_timer = next(iter(timers.values()), {})
+            time_start = first_timer.get("startTime")
+        if not time_start:
+            time_start = time.time()
+
+        questions_list = widget_config.get("questions") or []
+        q_info = questions_list[0] if questions_list else {}
+
+        return {
+            "widget_session_id": widget_session_id,
+            "prompt": q_info.get("prompt"),
+            "options": q_info.get("options") or [],
+            "widget_question_id": rpc_values.get("questionId") or q_info.get("id", ""),
+            "answers_order": rpc_values.get("answersOrder") or [opt.get("id") for opt in (q_info.get("options") or [])],
+            "time_start": time_start
+        }
+
     def _format_response(self, part_id: str, q_type: str, chosen: list = None, answer: str = None) -> dict:
         response_key, val_key = TYPE_LOOKUP[q_type]
         if q_type == "MULTIPLE_CHOICE":
             val = chosen[0] if chosen else None
         elif q_type == "CHECKBOX":
             val = chosen or []
+        elif q_type == "RICH_TEXT":
+            val = {"html": {"value": (answer or "").replace("—", "-")}}
+        elif q_type == "WIDGET":
+            meta = self.widget_metadata.get(part_id)
+            if meta:
+                chosen_id = (chosen[0] if chosen else None) or answer or ""
+                now = time.time()
+
+                widget_session_id = meta.get("widget_session_id")
+                if widget_session_id and chosen_id:
+                    try:
+                        rpc_url = f"https://www.coursera.org/api/widgetRpcActions.v1/?sessionId={widget_session_id}&action=setStoredValues"
+                        self.session.post(url=rpc_url, headers=self._get_headers(), json={
+                            "answer": {
+                                "answer": chosen_id,
+                                "time": now
+                            }
+                        })
+                    except Exception as e:
+                        logger.debug(
+                            f"Failed to set widget RPC stored value: {e}")
+
+                val = {
+                    "answer": {
+                        "answer": chosen_id,
+                        "time": now
+                    },
+                    "meta": {
+                        "timeStart": meta["time_start"],
+                        "answersOrder": meta["answers_order"],
+                        "questionId": meta["widget_question_id"]
+                    }
+                }
+            else:
+                val = answer if isinstance(answer, (dict, list)) else {}
+        elif isinstance(answer, (dict, list)):
+            val = answer
         else:
-            val = answer or None
+            val = str(answer) if answer is not None else ""
         return {
             "questionId": part_id,
             "questionType": q_type,
@@ -119,12 +226,14 @@ class GradedSolver(object):
                 logger.info("Resuming existing draft.")
 
             elif allowed is None:
-                rate_limiter = state.get("attempts", {}).get("rateLimiterConfig") or {}
+                rate_limiter = state.get("attempts", {}).get(
+                    "rateLimiterConfig") or {}
                 increase_at = rate_limiter.get("attemptsRemainingIncreasesAt")
                 retry_msg = ""
                 if increase_at:
                     try:
-                        dt_target = datetime.fromisoformat(increase_at.replace("Z", "+00:00"))
+                        dt_target = datetime.fromisoformat(
+                            increase_at.replace("Z", "+00:00"))
                         dt_now = datetime.now(timezone.utc)
                         delta = dt_target - dt_now
                         if delta.total_seconds() > 0:
@@ -138,7 +247,8 @@ class GradedSolver(object):
                         retry_msg = f" (Retry from {increase_at})"
 
                 if state.get("outcome") and state["outcome"].get("isPassed"):
-                    logger.warning(f"Passed, but below target grade.{retry_msg}")
+                    logger.warning(
+                        f"Passed, but below target grade.{retry_msg}")
                     return True
                 else:
                     logger.warning(f"No more attempts remaining!{retry_msg}")
@@ -158,34 +268,23 @@ class GradedSolver(object):
                 q_type = q["Type"]
                 options = q.get("Options", [])
 
-                if q_type == "TEXT_REFLECT":
-                    if q.get("correct_answer"):
-                        answer_responses.append(self._format_response(
-                            part_id=part_id,
-                            q_type="TEXT_REFLECT",
-                            answer=q["correct_answer"]
-                        ))
-                    else:
-                        unsolved_questions[part_id] = {
-                            "Question": q["Question"],
-                            "Options": [],
-                            "Type": "TEXT_REFLECT"
-                        }
-                elif q_type == "MULTIPLE_CHOICE":
-                    known_correct_id = next((opt["option_id"] for opt in options if opt.get("correct") is True), None)
+                if q_type == "MULTIPLE_CHOICE" or (q_type == "WIDGET" and options):
+                    known_correct_id = next(
+                        (opt["option_id"] for opt in options if opt.get("correct") is True), None)
                     if known_correct_id:
                         answer_responses.append(self._format_response(
                             part_id=part_id,
-                            q_type="MULTIPLE_CHOICE",
+                            q_type=q_type,
                             chosen=[known_correct_id]
                         ))
                         continue
 
-                    filtered_options = [opt for opt in options if opt.get("correct") is not False]
+                    filtered_options = [
+                        opt for opt in options if opt.get("correct") is not False]
                     if len(filtered_options) == 1:
                         answer_responses.append(self._format_response(
                             part_id=part_id,
-                            q_type="MULTIPLE_CHOICE",
+                            q_type=q_type,
                             chosen=[filtered_options[0]["option_id"]]
                         ))
                         continue
@@ -195,10 +294,25 @@ class GradedSolver(object):
                         "Options": filtered_options,
                         "Type": "MULTIPLE_CHOICE"
                     }
+                elif q_type in {"TEXT_REFLECT", "RICH_TEXT", "NUMERIC", "REGEX", "TEXT_EXACT_MATCH", "PLAIN_TEXT", "MATH", "WIDGET"}:
+                    if q.get("correct_answer"):
+                        answer_responses.append(self._format_response(
+                            part_id=part_id,
+                            q_type=q_type,
+                            answer=q["correct_answer"]
+                        ))
+                    else:
+                        unsolved_questions[part_id] = {
+                            "Question": q["Question"],
+                            "Options": [],
+                            "Type": q_type
+                        }
                 elif q_type == "CHECKBOX":
-                    all_resolved = all(opt.get("correct") is not None for opt in options)
+                    all_resolved = all(opt.get("correct")
+                                       is not None for opt in options)
                     if all_resolved:
-                        known_correct_checkbox_ids = [opt["option_id"] for opt in options if opt.get("correct") is True]
+                        known_correct_checkbox_ids = [
+                            opt["option_id"] for opt in options if opt.get("correct") is True]
                         answer_responses.append(self._format_response(
                             part_id=part_id,
                             q_type="CHECKBOX",
@@ -206,8 +320,10 @@ class GradedSolver(object):
                         ))
                         continue
 
-                    filtered_options = [opt for opt in options if opt.get("correct") is not False]
-                    known_correct_vals = [opt["value"] for opt in filtered_options if opt.get("correct") is True]
+                    filtered_options = [
+                        opt for opt in options if opt.get("correct") is not False]
+                    known_correct_vals = [
+                        opt["value"] for opt in filtered_options if opt.get("correct") is True]
                     question_text = q["Question"]
                     if known_correct_vals:
                         question_text += "\n\n(IMPORTANT NOTE: The following options are already known to be CORRECT and MUST be included in your chosen list:\n"
@@ -227,7 +343,8 @@ class GradedSolver(object):
                         for comb_entry in incorrect_combs:
                             comb = comb_entry["combination"]
                             score_info = f" (Score: {comb_entry.get('score')}/{comb_entry.get('max_score')})"
-                            chosen_ids = [opt["option_id"] for opt in filtered_options if opt["value"] in comb]
+                            chosen_ids = [opt["option_id"]
+                                          for opt in filtered_options if opt["value"] in comb]
                             if chosen_ids:
                                 virtual_feedbacks.append({
                                     "response": chosen_ids,
@@ -248,9 +365,21 @@ class GradedSolver(object):
                 llm_result = connector.get_response(
                     unsolved_questions, system_prompt=SYSTEM_PROMPT, response_schema=DEFAULT_RESPONSE_SCHEMA)
                 for ans in llm_result.get("responses", []):
+                    raw_q_id = ans["question_id"]
+                    real_q_id = raw_q_id
+                    if real_q_id not in questions:
+                        matched = next(
+                            (k for k in questions if k.endswith("~" + raw_q_id) or k.split("~")[-1] == raw_q_id), None)
+                        if matched:
+                            real_q_id = matched
+                        else:
+                            logger.warning(
+                                f"Could not find question key for LLM response: {raw_q_id}")
+                            continue
+
                     answer_responses.append(self._format_response(
-                        part_id=ans["question_id"],
-                        q_type=unsolved_questions[ans["question_id"]]["Type"], # Don't trust the LLM to echo back question_type
+                        part_id=real_q_id,
+                        q_type=questions[real_q_id]["Type"],
                         chosen=ans.get("chosen"),
                         answer=ans.get("answer")
                     ))
@@ -261,6 +390,7 @@ class GradedSolver(object):
             if not self.save_responses(answer_responses):
                 logger.error("Could not save responses. Please file an issue.")
                 return False
+
             if not self.submit_draft():
                 logger.error(
                     "Could not submit the assignment. Please file an issue.")
@@ -292,7 +422,7 @@ class GradedSolver(object):
         """
         Retrieves the current state of the assessment.
         """
-        res = self.session.post(url=GRAPHQL_URL, headers=get_csrf_headers(self.session), params={
+        res = self.session.post(url=GRAPHQL_URL, headers=self._get_headers(), params={
             "opname": "QueryState"
         }, json={
             "operationName": "QueryState",
@@ -309,7 +439,7 @@ class GradedSolver(object):
         """
         Initiates a new attempt for the assessment.
         """
-        res = self.session.post(url=GRAPHQL_URL, headers=get_csrf_headers(self.session), params={
+        res = self.session.post(url=GRAPHQL_URL, headers=self._get_headers(), params={
             "opname": "Submission_StartAttempt"
         }, json={
             "operationName": "Submission_StartAttempt",
@@ -335,6 +465,9 @@ class GradedSolver(object):
         questions_formatted = {}
 
         for question in questions:
+            if not question.get("questionSchema"):
+                continue
+
             # discard unknown question types
             if not question["__typename"] in QUESTION_TYPE_MAP:
                 continue
@@ -369,10 +502,34 @@ class GradedSolver(object):
                     "correct": existing_correctness.get(val, None)
                 })
 
+            prompt_obj = question["questionSchema"].get("prompt") or {}
+            question_text = prompt_obj.get("cmlValue") or (
+                prompt_obj.get("htmlWithMetadata") or {}).get("html") or ""
+
+            q_type = QUESTION_TYPE_MAP[question["__typename"]][1]
+
+            if q_type == "WIDGET":
+                widget_session_id = question["questionSchema"].get(
+                    "widgetSessionId")
+                if widget_session_id:
+                    widget_data = self.fetch_widget_data(widget_session_id)
+                    self.widget_metadata[part_id] = widget_data
+                    if not question_text and widget_data.get("prompt"):
+                        question_text = widget_data["prompt"]
+                    if widget_data.get("options"):
+                        options = []
+                        for opt in widget_data["options"]:
+                            val = opt.get("answer", "")
+                            options.append({
+                                "option_id": opt["id"],
+                                "value": val,
+                                "correct": existing_correctness.get(val, None)
+                            })
+
             questions_formatted[part_id] = {
-                "Question": question["questionSchema"]["prompt"]["cmlValue"],
+                "Question": question_text,
                 "Options": options,
-                "Type": QUESTION_TYPE_MAP[question["__typename"]][1],
+                "Type": q_type,
             }
 
             if "correct_answer" in existing:
@@ -389,7 +546,7 @@ class GradedSolver(object):
         """
         Saves the responses for the assessment to the draft.
         """
-        res = self.session.post(url=GRAPHQL_URL, headers=get_csrf_headers(self.session), params={
+        res = self.session.post(url=GRAPHQL_URL, headers=self._get_headers(), params={
             "opname": "Submission_SaveResponses"
         }, json={
             "operationName": "Submission_SaveResponses",
@@ -422,7 +579,7 @@ class GradedSolver(object):
         """
         Submits the draft for evaluation after the submission is saved.
         """
-        res = self.session.post(url=GRAPHQL_URL, headers=get_csrf_headers(self.session), params={
+        res = self.session.post(url=GRAPHQL_URL, headers=self._get_headers(), params={
             "opname": "Submission_SubmitLatestDraft"
         }, json={
             "operationName": "Submission_SubmitLatestDraft",
@@ -443,7 +600,7 @@ class GradedSolver(object):
         Fetches AssignmentFeedback for per-question correctness.
         """
         for i in range(max_retries):
-            res = self.session.post(url=GRAPHQL_URL, headers=get_csrf_headers(self.session), params={
+            res = self.session.post(url=GRAPHQL_URL, headers=self._get_headers(), params={
                 "opname": "AssignmentFeedback"
             }, json={
                 "operationName": "AssignmentFeedback",
@@ -485,7 +642,10 @@ class GradedSolver(object):
         response_lookup = {}
         for resp in submitted_responses:
             response_key, val_key = TYPE_LOOKUP[resp["questionType"]]
-            response_lookup[resp["questionId"]] = resp["questionResponse"][response_key][val_key]
+            val = resp["questionResponse"][response_key][val_key]
+            if resp["questionType"] == "RICH_TEXT" and isinstance(val, dict):
+                val = val.get("html", {}).get("value") or ""
+            response_lookup[resp["questionId"]] = val
 
         for part in feedback_parts:
             feedback_part_id = part.get("partId", "")
@@ -500,26 +660,31 @@ class GradedSolver(object):
             outcome = fb.get("autoGradedFeedbackOutcome") or {}
             submitted_chosen = response_lookup.get(our_part_id)
             our_q = self.questions_data[our_part_id]
-
-            if our_q.get("correct_answer") or (our_q["Type"] == "MULTIPLE_CHOICE" and any(opt.get("correct") is True for opt in our_q.get("Options", []))) or (our_q["Type"] == "CHECKBOX" and not any(opt.get("correct") is None for opt in our_q.get("Options", []))):
-                continue
-
             all_options = our_q.get("Options", [])
             question_type = our_q["Type"]
 
-            if question_type == "TEXT_REFLECT":
-                if correctness == "CORRECT":
+            if question_type == "WIDGET" and isinstance(submitted_chosen, dict):
+                submitted_chosen = (submitted_chosen.get(
+                    "answer") or {}).get("answer")
+
+            if (our_q.get("correct_answer") and not all_options) or (question_type in {"MULTIPLE_CHOICE", "WIDGET"} and any(opt.get("correct") is True for opt in all_options)) or (question_type == "CHECKBOX" and not any(opt.get("correct") is None for opt in all_options)):
+                continue
+
+            if question_type in {"TEXT_REFLECT", "RICH_TEXT", "NUMERIC", "REGEX", "TEXT_EXACT_MATCH", "PLAIN_TEXT", "MATH"} or (question_type == "WIDGET" and not all_options):
+                if correctness in {"CORRECT", None} and submitted_chosen is not None:
                     our_q["correct_answer"] = submitted_chosen
                 continue
 
-            is_single = question_type == "MULTIPLE_CHOICE"
+            is_single = question_type in {"MULTIPLE_CHOICE", "WIDGET"}
 
             chosen_texts = set()
             if submitted_chosen:
                 texts = self._get_response_text(all_options, submitted_chosen)
-                chosen_texts = {texts} if isinstance(texts, str) else set(texts)
+                chosen_texts = {texts} if isinstance(
+                    texts, str) else set(texts)
 
-            schema_options = (part.get("questionSchema") or {}).get("options") or []
+            schema_options = (part.get("questionSchema")
+                              or {}).get("options") or []
             if schema_options:
                 for opt in schema_options:
                     val = opt["display"].get("cmlValue")
@@ -528,7 +693,8 @@ class GradedSolver(object):
                     for our_opt in all_options:
                         if our_opt["value"] == val:
                             if "correctlyAnswered" in opt:
-                                our_opt["correct"] = opt["correctlyAnswered"] == (val in chosen_texts)
+                                our_opt["correct"] = opt["correctlyAnswered"] == (
+                                    val in chosen_texts)
 
             if correctness == "CORRECT":
                 for our_opt in all_options:
@@ -543,7 +709,7 @@ class GradedSolver(object):
                 elif not is_single and chosen_texts:
                     our_q.setdefault("incorrect_combinations", [])
                     comb = sorted(list(chosen_texts))
-                    
+
                     if not any(existing_comb["combination"] == comb for existing_comb in our_q["incorrect_combinations"]):
                         our_q["incorrect_combinations"].append({
                             "combination": comb,

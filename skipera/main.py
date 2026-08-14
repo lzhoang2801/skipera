@@ -1,7 +1,7 @@
 import click
 import httpx
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from .config import fetch_browser_cookies, CONFIG_FILE, DEFAULT_CONFIG, BASE_URL, HEADERS, COOKIES
+from .config import fetch_browser_cookies, CONFIG_FILE, DEFAULT_CONFIG, BASE_URL, HEADERS, COOKIES, GRAPHQL_URL
 import json
 from loguru import logger
 from .assessment.solver import GradedSolver
@@ -42,78 +42,94 @@ class Skipera(object):
         CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
 
     def get_userid(self) -> bool:
-        r = self.session.get(
-            self.base_url + "adminUserPermissions.v1?q=my").json()
-        try:
-            self.user_id = r["elements"][0]["id"]
+        r = self.session.get(self.base_url + "adminUserPermissions.v1?q=my")
+        if r.status_code == 200:
+            data = r.json()
+            self.user_id = str(data["elements"][0]["id"])
             logger.info("User ID: " + self.user_id)
-        except KeyError:
-            if r.get("errorCode"):
-                logger.error("Error Encountered: " + r["errorCode"])
-            return False
-        return True
+            return True
+        else:
+            data = r.json()
+            if data.get("errorCode"):
+                logger.error("Error Encountered: " + data["errorCode"])
+
+        return False
 
     def get_course(self) -> None:
-        r = self.get_course_materials()
-        self.course_id = r["elements"][0]["id"]
-        all_items = r["linked"]["onDemandCourseMaterialItems.v2"]
+        self.course_id = self.get_course_id()
+        num_items, num_modules, _ = self.get_course_items()
 
         logger.info("Course ID: " + self.course_id)
-        logger.info("Number of Modules: " +
-                    str(len(r["linked"]["onDemandCourseMaterialModules.v1"])))
-        logger.info("Total items: " + str(len(all_items)))
+        logger.info(f"Number of Modules: {num_modules}")
+        logger.info(f"Total items: {num_items}")
 
-        self.process_items(all_items)
+        self.process_items()
 
-    def get_course_materials(self) -> dict:
-        r = self.session.get(self.base_url + f"onDemandCourseMaterials.v2/", params={
+    def get_course_id(self) -> str:
+        r = self.session.get(self.base_url + "onDemandCourseMaterials.v2/", params={
             "q": "slug",
             "slug": self.course,
-            "includes": "modules,lessons,passableItemGroups,passableItemGroupChoices,passableLessonElements,items,"
-                        "tracks,gradePolicy,gradingParameters,embeddedContentMapping",
-            "fields": "moduleIds,onDemandCourseMaterialModules.v1(name,slug,description,timeCommitment,lessonIds,"
-                      "optional,learningObjectives),onDemandCourseMaterialLessons.v1(name,slug,timeCommitment,"
-                      "elementIds,optional,trackId),onDemandCourseMaterialPassableItemGroups.v1(requiredPassedCount,"
-                      "passableItemGroupChoiceIds,trackId),onDemandCourseMaterialPassableItemGroupChoices.v1(name,"
-                      "description,itemIds),onDemandCourseMaterialPassableLessonElements.v1(gradingWeight,"
-                      "isRequiredForPassing),onDemandCourseMaterialItems.v2(name,originalName,slug,timeCommitment,"
-                      "contentSummary,isLocked,lockableByItem,itemLockedReasonCode,trackId,lockedStatus,itemLockSummary,"
-                      "customDisplayTypenameOverride),onDemandCourseMaterialTracks.v1(passablesCount),"
-                      "onDemandGradingParameters.v1(gradedAssignmentGroups),"
-                      "contentAtomRelations.v1(embeddedContentSourceCourseId,subContainerId)",
-            "showLockedItems": True
+            "fields": "id"
         })
 
         if r.status_code != 200:
             logger.error("Please check if you are enrolled in the course!")
             raise SystemExit
 
-        return r.json()
+        return r.json()["elements"][0]["id"]
 
-    def process_items(self, all_items: list[dict]) -> None:
-        total = len(all_items)
+    def get_course_items(self) -> tuple[int, int, list[dict]]:
+        r = self.session.get(
+            self.base_url + "guidedCourseSessionProgresses.v1",
+            params={
+                "ids": f"{self.user_id}~{self.course_id}",
+                "fields": "id,startedAt,endedAt,weeks,courseProgressState"
+            }
+        )
 
+        if r.status_code != 200:
+            logger.error("Could not fetch guided course session progress.")
+            logger.debug(r.text)
+            return 0, 0, []
+
+        elements = r.json().get("elements") or []
+        if not elements:
+            logger.error("No items found in course.")
+            logger.debug(r.text)
+            return 0, 0, []
+
+        num_items = 0
+        uncompleted_items = []
+        num_modules = 0
+        weeks = elements[0].get("weeks") or []
+        for week in weeks:
+            modules = week.get("modules") or []
+            num_modules += len(modules)
+            for module in modules:
+                module_id = module.get("id", "unknown")
+                for item in module.get("items") or []:
+                    num_items += 1
+                    item["moduleId"] = module_id
+                    if item.get("computedProgressState") != "Completed":
+                        uncompleted_items.append(item)
+
+        return num_items, num_modules, uncompleted_items
+
+    def process_items(self) -> None:
         while True:
-            completed = self.get_completed_items()
-
-            try:
-                fresh_data = self.get_course_materials()
-                current_items = fresh_data["linked"]["onDemandCourseMaterialItems.v2"]
-            except SystemExit:
-                current_items = all_items
-
-            pending_items = [item for item in current_items if item["id"] not in completed]
-            if not pending_items:
-                logger.info(f"Finished: {total}/{total} completed.")
+            num_items, _, uncompleted_items = self.get_course_items()
+            if not uncompleted_items:
+                logger.error("No uncompleted items found in course.")
                 break
 
+            total = num_items
             unlocked_items = [
-                item for item in pending_items 
+                item for item in uncompleted_items
                 if not item.get("isLocked", False) and item["id"] not in self.failed_items
             ]
             if not unlocked_items:
                 logger.info(
-                    f"Finished: {total - len(pending_items)}/{total} completed, {len(pending_items)} still locked/pending."
+                    f"Finished: {total - len(uncompleted_items)}/{total} completed, {len(uncompleted_items)} still locked/pending."
                 )
                 break
 
@@ -128,7 +144,7 @@ class Skipera(object):
             if concurrent_items:
                 with ThreadPoolExecutor(max_workers=min(6, len(concurrent_items))) as executor:
                     futures = {
-                        executor.submit(self.process_item, item): item 
+                        executor.submit(self.process_item, item): item
                         for item in concurrent_items
                     }
                     for future in as_completed(futures):
@@ -176,6 +192,8 @@ class Skipera(object):
                 self.session, self.user_id, self.course_id, item_id).solve()
         elif item_type == "ungradedWidget":
             success = self.ungraded_widget_item(item_id)
+        elif item_type == "ungradedLab":
+            success = self.ungraded_lab_item(item_id)
         elif item_type == "ungradedLti":
             success = self.ungraded_lti_item(item_id)
         else:
@@ -183,31 +201,6 @@ class Skipera(object):
                 f"[module:{module_id}] [item:{item_id}] Unknown/skipped item type: {item_type} - skipping.")
 
         return success
-
-    def get_completed_items(self) -> set[str]:
-        r = self.session.get(
-            self.base_url +
-            f"onDemandCoursesProgress.v1/{self.user_id}~{self.course_id}",
-            params={"fields": "gradedAssignmentGroupProgress"}
-        )
-
-        if r.status_code != 200:
-            logger.debug("Could not fetch course progress.")
-            logger.debug(r.text)
-            return set()
-
-        data = r.json()
-        elements = data.get("elements") or []
-        if not elements:
-            logger.debug("Course progress response has no elements.")
-            return set()
-
-        items = elements[0].get("items", {})
-        return {
-            item_id
-            for item_id, progress in items.items()
-            if progress.get("progressState") == "Completed"
-        }
 
     def get_video_metadata(self, item_id: str) -> dict:
         r = self.session.get(self.base_url + f"onDemandLectureVideos.v1/{self.course_id}~{item_id}", params={
@@ -235,11 +228,13 @@ class Skipera(object):
 
     def ungraded_widget_item(self, item_id) -> bool:
         r = self.session.get(
-            self.base_url + f"onDemandWidgetSessions.v1/{self.user_id}~{self.course_id}~{item_id}",
+            self.base_url +
+            f"onDemandWidgetSessions.v1/{self.user_id}~{self.course_id}~{item_id}",
             params={"fields": "session,sessionId"}
         )
         if r.status_code != 200:
-            logger.error(f"Failed to get session for widget {item_id}: {r.status_code}")
+            logger.error(
+                f"Failed to get session for widget {item_id}: {r.status_code}")
             return False
 
         try:
@@ -249,7 +244,8 @@ class Skipera(object):
             return False
 
         res = self.session.put(
-            self.base_url + f"onDemandWidgetProgress.v1/{self.user_id}~{self.course_id}~{item_id}",
+            self.base_url +
+            f"onDemandWidgetProgress.v1/{self.user_id}~{self.course_id}~{item_id}",
             headers=get_csrf_headers(self.session),
             json={
                 "sessionId": session_id,
@@ -257,6 +253,47 @@ class Skipera(object):
             }
         )
         return 200 <= res.status_code < 300
+
+    def ungraded_lab_item(self, item_id: str) -> bool:
+        headers = get_csrf_headers(self.session)
+        headers["operation-name"] = "InLabInstructions_MarkInstructionAsComplete"
+
+        mutation = """
+mutation InLabInstructions_MarkInstructionAsComplete($input: InLabInstructions_MarkInstructionAsCompleteInput!) {
+  InLabInstructions_MarkInstructionAsComplete(input: $input) {
+    completedInstructions {
+      instructionId
+      __typename
+    }
+    course {
+      id
+      __typename
+    }
+    itemId
+    __typename
+  }
+}
+"""
+        res = self.session.post(
+            GRAPHQL_URL,
+            headers=headers,
+            params={"opname": "InLabInstructions_MarkInstructionAsComplete"},
+            json={
+                "operationName": "InLabInstructions_MarkInstructionAsComplete",
+                "variables": {
+                    "input": {
+                        "courseId": self.course_id,
+                        "itemId": item_id,
+                        "instructionId": "q4AHDS94Ee-PygJCrBEACA"
+                    }
+                },
+                "query": mutation
+            }
+        )
+        if 200 <= res.status_code < 300 and not res.json().get("errors"):
+            return True
+
+        return False
 
     def ungraded_lti_item(self, item_id) -> bool:
         r = self.session.post(
@@ -279,6 +316,7 @@ class Skipera(object):
 def main(slug: str, llm: bool) -> None:
     skipera = Skipera(slug, llm)
     skipera.get_course()
+
 
 if __name__ == '__main__':
     main()

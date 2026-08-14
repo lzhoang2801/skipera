@@ -803,6 +803,23 @@ fragment TextBlock on Submission_TextBlock {
 }
 """
 
+GET_WIDGET_SESSION_QUERY = """
+query GetWidgetSessionBySessionId($sessionId: ID!) {
+  WidgetSessions {
+    queryWidgetSessionBySessionId(sessionId: $sessionId) {
+      id
+      configuration {
+        ... on Plugins_WidgetSessionConfiguration {
+          data
+        }
+      }
+      __typename
+    }
+    __typename
+  }
+}
+"""
+
 SAVE_RESPONSES_QUERY = """
 mutation Submission_SaveResponses($input: Submission_SaveResponsesInput!) {
   Submission_SaveResponses(input: $input) {

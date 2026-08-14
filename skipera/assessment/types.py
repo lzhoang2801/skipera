@@ -1,8 +1,19 @@
 # webpack:///static/__generated__/graphql-types.ts
 from pydantic import BaseModel
-from typing import List, Optional, Any, Literal, get_origin
+from typing import List, Optional, Any, Literal, get_origin, get_args, Union
 
-WHITELISTED_QUESTION_TYPES = ["Submission_CheckboxQuestion", "Submission_MultipleChoiceQuestion", "Submission_TextReflectQuestion"]
+WHITELISTED_QUESTION_TYPES = [
+    "Submission_CheckboxQuestion",
+    "Submission_MultipleChoiceQuestion",
+    "Submission_TextReflectQuestion",
+    "Submission_RichTextQuestion",
+    "Submission_NumericQuestion",
+    "Submission_RegexQuestion",
+    "Submission_TextExactMatchQuestion",
+    "Submission_PlainTextQuestion",
+    "Submission_MathQuestion",
+    "Submission_WidgetQuestion"
+]
 
 
 QUESTION_TYPE_MAP = {
@@ -77,8 +88,12 @@ class Submission_RegexQuestion(BaseModel):
     answer: Optional[str] = None
 
 
-class Submission_RichTextInput(BaseModel):
+class Submission_HtmlContentInput(BaseModel):
     value: Optional[str] = None
+
+
+class Submission_RichTextInput(BaseModel):
+    html: Optional[Submission_HtmlContentInput] = None
 
 
 class Submission_RichTextQuestion(BaseModel):
@@ -121,19 +136,31 @@ MODEL_MAP = {
 }
 
 
-# Bad recursive function
 def deep_blank_model(model_cls):
     data = {}
     for name, field in model_cls.model_fields.items():
         annotation = field.annotation
+        origin = get_origin(annotation)
 
-        if get_origin(annotation) is Literal:
-            literal_values = annotation.__args__
+        if origin is Literal:
+            literal_values = get_args(annotation)
             data[name] = literal_values[0]
             continue
 
-        if isinstance(annotation, type) and issubclass(annotation, BaseModel):
-            data[name] = deep_blank_model(annotation)
+        target_type = annotation
+        if origin is Union:
+            args = [a for a in get_args(annotation) if a is not type(None)]
+            if args:
+                target_type = args[0]
+
+        if isinstance(target_type, type) and issubclass(target_type, BaseModel):
+            data[name] = deep_blank_model(target_type)
+        elif target_type is str:
+            data[name] = ""
+        elif get_origin(target_type) is list or target_type is list:
+            data[name] = []
+        elif target_type is Any or target_type is dict or get_origin(target_type) is dict:
+            data[name] = {}
         else:
             data[name] = None
 
